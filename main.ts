@@ -9,6 +9,7 @@ import {
 	Setting,
 	TAbstractFile,
 	TFile,
+	TFolder,
 	MarkdownPostProcessorContext,
 } from 'obsidian';
 import {
@@ -77,8 +78,6 @@ export default class CaptainsLogPlugin extends Plugin {
 				} else {
 					// No active markdown view – notify and set insertion to new note.
 					new Notice("No active file open. The transcript will be generated in a new note.");
-					// Optionally, you can open a modal here to let the user select an audio file.
-					// Or, if you already have the audio file reference by other means, call transcribeRecording directly.
 				}
 			},
 		});
@@ -210,7 +209,7 @@ export default class CaptainsLogPlugin extends Plugin {
 				if (!keepAudio) {
 					await this.app.vault.delete(file);
 					const folder = this.app.vault.getAbstractFileByPath(this.settings.recordingFilePath);
-					if (folder instanceof TAbstractFile && folder.children.length === 0) {
+					if (folder instanceof TFolder && folder.children.length === 0) {
 						await this.app.vault.delete(folder);
 					}
 				}
@@ -238,16 +237,13 @@ export default class CaptainsLogPlugin extends Plugin {
 		// Determine the mime type based on the file extension.
 		const mimeType = this.getMimeType(audioFile);
 
-
 		// Read the audio file as binary and create a Blob.
 		const arrayBuffer = await this.app.vault.adapter.readBinary(audioFile.path);
 		const blob = new Blob([arrayBuffer], { type: mimeType });
 
-		// Replace Google GenAI file.upload and generateContent calls with REST API fetch calls.
 		try {
 			// Determine the file size and mime type.
 			const numBytes = blob.size;
-			// (mimeType is obtained using getMimeType as before.)
 			const displayName = "AUDIO";
 
 			// Step 1: Initiate resumable upload to get the upload URL.
@@ -290,8 +286,26 @@ export default class CaptainsLogPlugin extends Plugin {
 			// Load the template content (if any)
 			const templateContent = await this.loadTemplateContent();
 
-			// Combine the prompt and template (you may adjust how you combine them as needed)
-			const combinedPrompt = this.settings.prompt + (templateContent ? ("\n\nTemplate:\n" + templateContent) : "");
+			// Get current Swedish time for prompt + note header
+			const now = new Date();
+			const nowString = now.toLocaleString('sv-SE', {
+				timeZone: 'Europe/Stockholm',
+				hour12: false,
+			});
+
+			// Time instruction to avoid model guessing time/date
+			const timeInstruction =
+				`Aktuell tid när denna anteckning genereras är ${nowString} i tidszonen Europe/Stockholm. ` +
+				`Du får inte gissa nuvarande datum eller tid. ` +
+				`Om talaren säger ett annat datum eller en annan tid i inspelningen är det den som gäller. ` +
+				`Om ingen tid nämns ska du undvika att ange exakt datum/klockslag.`;
+
+			// Combine the prompt and template
+			const combinedPromptBase =
+				this.settings.prompt +
+				(templateContent ? ("\n\nTemplate:\n" + templateContent) : "");
+
+			const combinedPrompt = `${timeInstruction}\n\n${combinedPromptBase}`;
 
 			// Step 3: Call generateContent using the REST API.
 			const generatePayload = {
@@ -326,25 +340,36 @@ export default class CaptainsLogPlugin extends Plugin {
 				generateData.candidates[0].content.parts[0].text
 			) {
 				this.transcript = generateData.candidates[0].content.parts[0].text;
+
+				// Datum+Tid-header för anteckningen
+				const headerLine = `${nowString} ->\n\n`;
+
 				if (this.settings.insertTranscriptLocation === "inline") {
-					// At this point, activeView is guaranteed to exist.
-					const editor = activeView.editor;
+					// At this point, activeView should exist but we still guard for safety
+					activeView = this.app.workspace.getActiveViewOfType(MarkdownView);
+					const editor = activeView?.editor;
+					if (!editor) {
+						new Notice("No active editor found to insert transcript.");
+						return;
+					}
 					const LnToWrite = this.getNextNewLine(editor, editor.getCursor("to").line);
-					editor.replaceRange(this.transcript, { line: LnToWrite, ch: 0 });
+					editor.replaceRange(headerLine + this.transcript, { line: LnToWrite, ch: 0 });
 					new Notice("Transcript generated and inserted inline.");
 				} else if (this.settings.insertTranscriptLocation === "newNote") {
 					// Create a new note with the transcript.
-					// Prepend the audio file link if the setting is enabled.
 					let transcriptContent = "";
+
+					// Add header line first
+					transcriptContent += headerLine;
+
+					// Prepend the audio file link if the setting is enabled.
 					if (this.settings.includeAudioFileLink) {
-						// Use the audioFile parameter passed to transcribeRecording.
 						transcriptContent += `![[${audioFile.path}]]\n\n`;
 					}
 					transcriptContent += this.transcript;
 					
 					// Generate a unique title and note path.
-					const timestamp = new Date().toISOString().replace(/:/g, "-");
-					const date = new Date();
+					const date = now;
 					const formattedDate = date.toISOString().slice(0, 10);
 					const hours = date.getHours();
 					const ampm =
@@ -379,13 +404,24 @@ export default class CaptainsLogPlugin extends Plugin {
 						// Fallback: use active file's folder if exists, or vault root.
 						const activeFile = this.app.workspace.getActiveFile();
 						if (activeFile) {
-							const folderPath = activeFile.parent.path;
-							let noteCount = 1;
-							while (this.app.vault.getAbstractFileByPath(`${folderPath}/${finalTitle}.md`)) {
-								noteCount++;
-								finalTitle = `Captain's Log ${formattedDate}-${ampm}-${noteCount}`;
+							const parent = activeFile.parent;
+							if (!parent) {
+								new Notice("Active file has no parent folder. Using vault root instead.");
+								let noteCount = 1;
+								while (this.app.vault.getAbstractFileByPath(`${finalTitle}.md`)) {
+									noteCount++;
+									finalTitle = `Captain's Log ${formattedDate}-${ampm}-${noteCount}`;
+								}
+								notePath = `${finalTitle}.md`;
+							} else {
+								const folderPath = parent.path;
+								let noteCount = 1;
+								while (this.app.vault.getAbstractFileByPath(`${folderPath}/${finalTitle}.md`)) {
+									noteCount++;
+									finalTitle = `Captain's Log ${formattedDate}-${ampm}-${noteCount}`;
+								}
+								notePath = normalizePath(`${folderPath}/${finalTitle}.md`);
 							}
-							notePath = normalizePath(`${folderPath}/${finalTitle}.md`);
 						} else {
 							let noteCount = 1;
 							while (this.app.vault.getAbstractFileByPath(`${finalTitle}.md`)) {
@@ -409,9 +445,9 @@ export default class CaptainsLogPlugin extends Plugin {
 			} else {
 				throw new Error("No text returned from AI model.");
 			}
-		} catch (error) {
+		} catch (error: any) {
 			console.error("Transcription failed:", error);
-			new Notice(error.message);
+			new Notice(error.message ?? "Transcription failed.");
 		}
 	}
 
@@ -460,7 +496,7 @@ export default class CaptainsLogPlugin extends Plugin {
 		const regex = [
 			/\[\[(([^\[\]]+)\.(mp3|wav))\]\]/g,
 			/\[.*?\]\((([^\[\]()]+)\.(mp3|wav))\)/g,
-		  ];
+		];
 
 		this.findFilePath(text, regex)
 			.then((path) => {
@@ -488,7 +524,7 @@ export default class CaptainsLogPlugin extends Plugin {
 					});
 				}
 			})
-			.catch((error) => {
+			.catch((error: any) => {
 				console.warn(error.message);
 				new Notice(error.message);
 			});
@@ -631,17 +667,17 @@ class CaptainsLogSettingTab extends PluginSettingTab {
 			);
 
 		new Setting(containerEl)
-		.setName("Transcript Insertion Location")
-		.setDesc("Choose whether to insert the transcript inline in the active file or in a new note.")
-		.addDropdown(dropdown => {
-			dropdown.addOption("inline", "Inline");
-			dropdown.addOption("newNote", "New Note");
-			dropdown.setValue(this.plugin.settings.insertTranscriptLocation);
-			dropdown.onChange(async (value: "inline" | "newNote") => {
-				this.plugin.settings.insertTranscriptLocation = value;
-				await this.plugin.saveSettings();
+			.setName("Transcript Insertion Location")
+			.setDesc("Choose whether to insert the transcript inline in the active file or in a new note.")
+			.addDropdown(dropdown => {
+				dropdown.addOption("inline", "Inline");
+				dropdown.addOption("newNote", "New Note");
+				dropdown.setValue(this.plugin.settings.insertTranscriptLocation);
+				dropdown.onChange(async (value: "inline" | "newNote") => {
+					this.plugin.settings.insertTranscriptLocation = value;
+					await this.plugin.saveSettings();
+				});
 			});
-		});
 
 		new Setting(containerEl)
 			.setName('Template Note File Path')
