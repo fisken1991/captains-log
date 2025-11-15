@@ -85,13 +85,13 @@ export default class CaptainsLogPlugin extends Plugin {
 				audioLinks.forEach((link) => {
 					const href = link.getAttribute('data-href');
 					if (!href) {
-						console.error("Failed to get the href attribute from the link element.");
+						console.error('Failed to get the href attribute from the link element.');
 						return;
 					}
 
 					const abstractFile = this.app.vault.getAbstractFileByPath(href);
 					if (!(abstractFile instanceof TFile)) {
-						console.error("The path does not point to a valid file in the vault.");
+						console.error('The path does not point to a valid file in the vault.');
 						return;
 					}
 
@@ -113,7 +113,7 @@ export default class CaptainsLogPlugin extends Plugin {
 		);
 
 		// Add a ribbon icon for quick recording.
-		this.addRibbonIcon('book-audio', "Record Captain's Log", async (evt: MouseEvent) => {
+		this.addRibbonIcon("book-audio", "Record Captain's Log", async (evt: MouseEvent) => {
 			const audioFileBlob = await new AudioRecordModal(
 				this.app,
 				this.handleAudioRecording.bind(this),
@@ -158,7 +158,7 @@ export default class CaptainsLogPlugin extends Plugin {
 					editor.replaceRange('', { line: cursor.line, ch: cursor.ch }, { line: cursor.line, ch: cursor.ch });
 				}
 			}
-			
+
 			// Trigger transcription if requested.
 			if (transcribe) {
 				await this.transcribeRecording(file);
@@ -182,7 +182,6 @@ export default class CaptainsLogPlugin extends Plugin {
 		// Determine the mime type based on the file extension.
 		const mimeType = this.getMimeType(audioFile);
 
-
 		try {
 			// Read the audio file as binary and create a Blob.
 			const arrayBuffer = await this.app.vault.adapter.readBinary(audioFile.path);
@@ -198,26 +197,59 @@ export default class CaptainsLogPlugin extends Plugin {
 			// log the API key
 			console.log('Google API Key:', this.settings.apiKey);
 
-			// Build the prompt from your settings.
-			const promptText = this.settings.prompt;
+			// Build the base prompt from your settings.
+			const basePrompt = this.settings.prompt;
+
+			// Get current Swedish time (for AI instructions)
+			const nowStringForPrompt = new Date().toLocaleString('sv-SE', {
+				timeZone: 'Europe/Stockholm',
+				hour12: false,
+			});
+
+			// Instruction about time/date – model may not guess
+			const timeInstruction =
+				`Aktuell tid när denna anteckning genereras är ${nowStringForPrompt} ` +
+				`i tidszonen Europe/Stockholm. ` +
+				`Du får inte gissa nuvarande datum eller tid. ` +
+				`Om du behöver referera till "nu" ska du utgå från denna tidpunkt. ` +
+				`Om talaren säger ett annat datum eller en annan tid i inspelningen är det den som gäller. ` +
+				`Om ingen tid nämns ska du undvika att ange exakt datum/klockslag.`;
+
+			// Combine time instruction + your normal prompt
+			const fullPrompt = `${timeInstruction}\n\n${basePrompt}`;
 
 			// Generate content using Google GenAI.
+			// Viktigt: textprompt först, sedan audio-filens URI.
 			const contents = createUserContent([
+				fullPrompt,
 				createPartFromUri(uploadedFile.uri!, uploadedFile.mimeType!),
-				promptText,
 			]);
-			console.log("Generated user content:", JSON.stringify(contents, null, 2));
+			console.log('Generated user content:', JSON.stringify(contents, null, 2));
 
 			const response = await this.ai.models.generateContent({
 				model: this.settings.model,
 				contents,
 			});
-			console.log("Generate content response:", response);
+			console.log('Generate content response:', response);
 
-			if (response && response.text) {
+			if (response && (response as any).text) {
+				// @ts-ignore – beroende på SDK-version kan text ligga direkt på response
 				this.transcript = response.text;
+
+				// Hämta datum+tid i svensk tidzon för att skriva överst i noten
+				const nowStringForNote = new Date().toLocaleString('sv-SE', {
+					timeZone: 'Europe/Stockholm',
+					hour12: false,
+				});
+
+				// Rad direkt under "# Transcript"
+				const headerLine = `${nowStringForNote} ->\n\n`;
+
 				const LnToWrite = this.getNextNewLine(editor, editor.getCursor('to').line);
-				editor.replaceRange('\n# Transcript\n' + this.transcript, { line: LnToWrite, ch: 0 });
+				editor.replaceRange(
+					'\n# Transcript\n' + headerLine + this.transcript,
+					{ line: LnToWrite, ch: 0 }
+				);
 				new Notice('Transcript generated.');
 			} else {
 				throw new Error('No text returned from AI model.');
@@ -226,12 +258,11 @@ export default class CaptainsLogPlugin extends Plugin {
 			if (!this.settings.keepAudio) {
 				await this.app.vault.delete(audioFile);
 			}
-		} catch (error) {
+		} catch (error: any) {
 			console.error('Transcription failed:', JSON.stringify(error, null, 2));
-			new Notice(error.message);
+			new Notice(error.message ?? 'Transcription failed');
 		}
 	}
-	  
 
 	// Helper to determine mime type from file extension.
 	getMimeType(file: TFile): string {
@@ -293,7 +324,7 @@ export default class CaptainsLogPlugin extends Plugin {
 					});
 				}
 			})
-			.catch((error) => {
+			.catch((error: any) => {
 				console.warn(error.message);
 				new Notice(error.message);
 			});
@@ -325,7 +356,6 @@ export default class CaptainsLogPlugin extends Plugin {
 	async saveSettings() {
 		await this.saveData(this.settings);
 	}
-	
 }
 
 // A settings tab for configuration within Obsidian.
